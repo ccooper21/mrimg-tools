@@ -1,10 +1,11 @@
 #!/usr/bin/python
 
-import struct
 import sys
-import os
+
 
 class ImageDecompressor(object):
+
+    IMAGE_PREAMBLE_LEN = 9
 
     _file = None
 
@@ -12,105 +13,121 @@ class ImageDecompressor(object):
         self._file = open(file_name, 'rb')
 
     def __del__(self):
-        if self._file != None:
+        if self._file is not None:
             self._file.close()
 
     def get_bytes(self):
+
+        block_num = 0
         out_bytes = ''
-        out_offset = 0
+
+        def extract_dword(block, offset):
+            return block[offset + 3] << 24 | block[offset + 2] << 16 | block[offset + 1] << 8 | block[offset]
+
+        def extract_bits(value, first, count):
+            return ((value & (1 << (first + count)) - 1)) >> first
 
         while True:
-            in_preamble_len = 9
-            in_bytes = self._file.read(in_preamble_len)
-            (in_unknown, in_block_len, out_block_len) = struct.unpack('<BII', in_bytes)
+            in_block = bytearray(self._file.read(self.IMAGE_PREAMBLE_LEN))
+            in_preamble_flags = in_block[0]
+            in_block_len = extract_dword(in_block, 1)
+            out_block_expected_len = extract_dword(in_block, 5)
 
-            if in_unknown != 0x03:
+            # An .mrimg file includes a trailer with metadata about the
+            # image such as the offset where the imaged data ends.  Ultimately
+            # this code needs to be made of this metadata such that it
+            # reliably knows when to stop decompressing image data.  In the
+            # mean time, the following check is sufficient for determining
+            # that the next chunk of data does not include a valid block
+            # preamble.  This indicates that no more image data is available
+            # and that decompression is complete.
+            if in_preamble_flags != 0x03:
                 return out_bytes
 
-            in_body_len = in_block_len - in_preamble_len
-            in_bytes += self._file.read(in_body_len)
-            in_offset = in_preamble_len
+            in_block_remaining_bytes_len = in_block_len - self.IMAGE_PREAMBLE_LEN
+            in_block += bytearray(self._file.read(in_block_remaining_bytes_len))
+            in_block_offset = self.IMAGE_PREAMBLE_LEN
 
-            control_bits = 0x00000001
-            while in_offset < in_block_len:
-                if control_bits == 0x00000001:
-                    (control_bits,) = struct.unpack('<I', in_bytes[in_offset:in_offset + 4])
-                    control_bits |= 0x80000000
-                    in_offset += 4
+            out_block = bytearray(out_block_expected_len)
+            out_block_offset = 0
 
-                print '--> In: 0x%x Out: 0x%x Control: 0x%8x' % (in_offset, out_offset, control_bits)
+            control_flags = 0x00000001
+            while in_block_offset < in_block_len:
+                if control_flags == 0x00000001:
+                    control_flags = extract_dword(in_block, in_block_offset)
+                    control_flags |= 0x80000000
+                    in_block_offset += 4
+                    continue
 
-                emit_single_byte = ~control_bits & 0x00000001
-                control_bits >>= 1
+                print '--> Block: %4d\tIn Offset: 0x%8x\tOut Offset: 0x%8x\tFlags: 0x%8x' % (block_num, in_block_offset, out_block_offset, control_flags)
 
-                if emit_single_byte:
-                    out_byte = in_bytes[in_offset]
-                    in_offset += 1
+                is_literal = not control_flags & 0x00000001
+                if is_literal:
+                    print '  --> Literal \'%c\' (0x%02x)' % (in_block[in_block_offset], in_block[in_block_offset])
 
-                    out_bytes += out_byte
-                    out_offset += 1
+                    out_byte = in_block[in_block_offset]
+                    out_block[out_block_offset] = out_byte
+                    in_bytes_consumed = 1
+                    out_bytes_emitted = 1
 
                 else:
-                    (first_byte,) = struct.unpack('<B', in_bytes[in_offset])
-                    operation = first_byte & 0x0F
+                    print '  --> Operation Nibble 0x%01x' % (extract_bits(extract_dword(in_block, in_block_offset), 0, 4))
 
-                    print '  --> op_nimble 0x%01x / op_byte 0x%02x' % (operation, first_byte)
+                    in_bytes = extract_dword(in_block, in_block_offset)
+                    operation = extract_bits(in_bytes, 0, 4)
 
                     if (operation & 0x0F) == 0x0F:
-                        (segment_len, out_byte) = struct.unpack('<BB', in_bytes[in_offset + 1:in_offset + 3])
-                        out_byte = chr(out_byte)
-                        segment_len = segment_len << 4 | first_byte >> 4
-                        in_offset += 3
+                        run_len = extract_bits(in_bytes, 4, 12)
+                        out_byte = extract_bits(in_bytes, 16, 8)
+                        in_bytes_consumed = 3
+                        if run_len == 0:
+                            run_len = extract_dword(in_block, in_block_offset + 3)
+                            in_bytes_consumed += 4
 
-                        if segment_len == 0:
-                            (segment_len,) = struct.unpack('<I', in_bytes[in_offset:in_offset + 4])
-                            in_offset += 4
-
-                        out_bytes += ''.join(out_byte for _ in range(segment_len))
-                        out_offset += segment_len
+                        for i in range(out_block_offset, out_block_offset + run_len + 1):
+                            out_block[i] = out_byte
+                        out_bytes_emitted = run_len
 
                     else:
+                        segment_len = 3
                         if (operation & 0x0F) == 0x07:
-                            (segment_len, out_relative_start_offset) = struct.unpack('<BH', in_bytes[in_offset + 1:in_offset + 4])
-                            out_relative_start_offset = out_relative_start_offset << 1 | segment_len >> 7
-                            out_relative_stop_offset = 3
-                            segment_len = (segment_len & 0x7F) << 4 | first_byte >> 4
-                            in_offset += 4
+                            segment_len += extract_bits(in_bytes, 4, 11)
+                            out_relative_start_offset = extract_bits(in_bytes, 15, 17)
+                            in_bytes_consumed = 4
+                            if segment_len == 0 and out_relative_start_offset == 0:
+                                segment_len = extract_dword(in_block, in_block_offset + 4)
+                                out_relative_start_offset = extract_dword(in_block, in_block_offset + 8)
+                                in_bytes_consumed += 8
 
                         elif (operation & 0x07) == 0x03:
-                            (out_relative_start_offset,) = struct.unpack('<H', in_bytes[in_offset + 1:in_offset + 3])
-                            out_relative_stop_offset = 3
-                            segment_len = (first_byte >> 3)
-                            in_offset += 3
+                            segment_len += extract_bits(in_bytes, 3, 5)
+                            out_relative_start_offset = extract_bits(in_bytes, 8, 16)
+                            in_bytes_consumed = 3
 
                         elif (operation & 0x03) == 0x02:
-                            (out_relative_start_offset,) = struct.unpack('<B', in_bytes[in_offset + 1:in_offset + 2])
-                            out_relative_start_offset = out_relative_start_offset << 2 | first_byte >> 6
-                            out_relative_stop_offset = 3
-                            segment_len = (first_byte >> 2) & 0x0F
-                            in_offset += 2
+                            segment_len += extract_bits(in_bytes, 2, 4)
+                            out_relative_start_offset = extract_bits(in_bytes, 6, 10)
+                            in_bytes_consumed = 2
 
                         elif (operation & 0x03) == 0x01:
-                            (out_relative_start_offset,) = struct.unpack('<B', in_bytes[in_offset + 1:in_offset + 2])
-                            out_relative_start_offset = out_relative_start_offset << 6 | first_byte >> 2
-                            out_relative_stop_offset = 3
-                            segment_len = 0
-                            in_offset += 2
+                            out_relative_start_offset = extract_bits(in_bytes, 2, 14)
+                            in_bytes_consumed = 2
 
                         elif (operation & 0x03) == 0x00:
-                            out_relative_start_offset = first_byte >> 2
-                            out_relative_stop_offset = 3
-                            segment_len = 0
-                            in_offset += 1
+                            out_relative_start_offset = extract_bits(in_bytes, 2, 6)
+                            in_bytes_consumed = 1
 
-                        out_current_offset = out_offset - out_relative_start_offset
-                        out_stop_offset = out_current_offset + out_relative_stop_offset + segment_len - 1
-                        while out_current_offset <= out_stop_offset:
-                            out_bytes += out_bytes[out_current_offset]
-                            out_current_offset += 1
-                            out_offset += 1
+                        out_block_start_offset = out_block_offset - out_relative_start_offset
+                        for i in range(0, segment_len + 1):
+                            out_byte = out_block[out_block_start_offset + i]
+                            out_block[out_block_offset + i] = out_byte
+                        out_bytes_emitted = segment_len
 
-        return out_bytes
+                in_block_offset += in_bytes_consumed
+                out_block_offset += out_bytes_emitted
+                control_flags >>= 1
+            block_num += 1
+            out_bytes += out_block
 
 if __name__ == '__main__':
 
@@ -120,11 +137,11 @@ if __name__ == '__main__':
 
     try:
         out_file = open(sys.argv[2], 'wb')
-        
+
         decompressor = ImageDecompressor(sys.argv[1])
-    
+
         out_bytes = decompressor.get_bytes()
         out_file.write(out_bytes)
-        
+
     finally:
         out_file.close()
